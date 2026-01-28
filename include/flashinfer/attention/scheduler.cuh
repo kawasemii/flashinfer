@@ -346,7 +346,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM8
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename IdType>
-inline auto DecodeSplitKVIndptr(IdType* indptr_h, uint32_t batch_size, uint32_t kv_chunk_size) {
+inline auto DecodeSplitKVIndptr(IdType* indptr_h, uint32_t batch_size, uint32_t kv_chunk_size) { // indptr: the indptr of the paged kv cache, shape: ``[batch_size + 1]``
   std::vector<IdType> request_indices, kv_tile_indices, o_indptr;
   o_indptr.push_back(0);
 
@@ -441,7 +441,7 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   plan_info.enable_cuda_graph = enable_cuda_graph;
   plan_info.split_kv = split_kv;
   padded_batch_size =
-      (enable_cuda_graph) ? (split_kv ? max_grid_size / gdy : batch_size) : new_batch_size;
+      (enable_cuda_graph) ? (split_kv ? max_grid_size / gdy : batch_size) : new_batch_size; // if no cuda graph no split kv, padded_batch_size = new_batch_size = batch_size
   plan_info.padded_batch_size = padded_batch_size;
   auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
       DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
