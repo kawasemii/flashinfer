@@ -49,12 +49,12 @@ struct paged_kv_t {
   // [max_num_pages, page_size, num_heads, head_dim] if layout == NHD
   DType* k_data;
   DType* v_data;
-  IdType* indices;
+  IdType* indices; // kv cache's page indices in page table
 
   // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
-  IdType* indptr;
+  IdType* indptr; // indptr[i]: starting idx of batch i in `indices`
   // [batch_size] The offset of the last page for each request in the batch
-  IdType* last_page_len;
+  IdType* last_page_len; // last_page_len[i]: batch i's last page (the one page that isn't full) len (must be <= page size and > 0)
   // [batch_size] The start position of each request in the batch.
   IdType* rope_pos_offset;
 
@@ -105,7 +105,7 @@ struct paged_kv_t {
     stride_page = num_heads * page_size * head_dim;
     this->k_data = k_data;
     this->v_data = v_data;
-    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
+    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim; // 从 page_size (即 token 维度) 维度移动一步需要跨越多少个内存上的元素
     stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
   }
 
@@ -155,13 +155,15 @@ struct paged_kv_t {
    * \brief Compute the offset of element in the allocated buffer.
    * \param page_idx The page index
    * \param head_idx The head index
-   * \param entry_idx The page entry index
+   * \param entry_idx The page entry index (token idx in page)
    * \param feat_idx The feature index
    */
   __host__ __device__ __forceinline__ size_t get_elem_offset(size_t page_idx, size_t head_idx,
                                                              size_t entry_idx,
                                                              size_t feat_idx) const {
     return page_idx * stride_page + head_idx * stride_h + entry_idx * stride_n + feat_idx;
+    // current page offset + current head offset + current token offset + feat offset
+    //                      -------------------- elem offset in page ----------------
   }
 
   /*!
