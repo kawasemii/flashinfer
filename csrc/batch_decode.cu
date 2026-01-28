@@ -38,7 +38,7 @@ using tvm::ffi::Optional;
 
 Array<int64_t> BatchDecodeWithPagedKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
-    TensorView page_locked_int_workspace_buffer, TensorView indptr, int64_t batch_size,
+    TensorView page_locked_int_workspace_buffer, TensorView indptr, int64_t batch_size, // indptr: The indptr of the paged kv cache, shape: ``[batch_size + 1]``
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
     TensorView empty_q_data, TensorView empty_kv_data) {
@@ -116,9 +116,9 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  // get q_stride_n and q_stride_h
-  const auto q_stride_n = q.stride(0);
-  const auto q_stride_h = q.stride(1);
+  // get q_stride_n and q_stride_h 一般来说 q.shape = [batch_size, num_heads, head_dim]
+  const auto q_stride_n = q.stride(0); // stride_n 表示在 token (decode 一个 request 的 q 就一个 token，所以也是 batch_size 维度) 维度的步长，从这一个 token 到下一个 token 在内存上要跨越几个元素
+  const auto q_stride_h = q.stride(1); // stride_h 表示在 head (即 num_heads 维度) 维度的步长，从这一个 head 到下一个 head 在内存上要跨越几个元素
 
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
