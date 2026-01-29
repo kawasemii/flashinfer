@@ -413,30 +413,44 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const uint32_t num_qo_heads = params.num_qo_heads;
   const bool partition_kv = params.partition_kv;
 
-  constexpr uint32_t head_dim = bdx * vec_size; // !!!
-  const uint32_t batch_idx = params.request_indices[bx];
-  const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
-  const uint32_t kv_head_idx = by; // !!!
-  const uint32_t qo_head_idx = kv_head_idx * bdy + ty;
+  constexpr uint32_t head_dim = bdx * vec_size; // constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  const uint32_t batch_idx = params.request_indices[bx]; // request index in current batch, if !split_kv, batch_idx == bx
+  const uint32_t kv_tile_idx = params.kv_tile_indices[bx]; // if !split_kv, kv_tile_idx == bx
+  const uint32_t kv_head_idx = by; // constexpr uint32_t bdy = GROUP_SIZE;
+  const uint32_t qo_head_idx = kv_head_idx * bdy + ty; // kv_head_idx * bdy calculates the qo head's group, ty means qo head's offset in 1 group
   // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
   // the actual batch size, so we need to check if the current batch is valid
   if (block_valid_mask && !block_valid_mask[bx]) return;
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr); // kv_chunk_size_ptr_h[0] = kv_chunk_size_in_pages * page_size; 就一个元素
-  const uint32_t kv_len = paged_kv.get_length(batch_idx);
+  const uint32_t kv_len = paged_kv.get_length(batch_idx); // current request's kv len (# tokens)
   const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len; // partition_kv == split_kv (?)
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
   const uint32_t chunk_end =
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
-  const uint32_t chunk_size = chunk_end - chunk_start;
+  const uint32_t chunk_size = chunk_end - chunk_start; // !split_kv, chunk_size = kv_len of current request
 
   AttentionVariant variant(params, batch_idx, smem);
-  DTypeKV* k_smem = (DTypeKV*)smem;
+  // smem is shared by all threads in threadblock
+  DTypeKV* k_smem = (DTypeKV*)smem; 
+  // K_smem[pipeline_stage][token_tile_size_per_][group_size][bdz][head_dim]
+  // num_stages_smem: pipeline_stage，计算 stage i 的时候去加载 stage i+1 所需的数据
+  // tile_size_per_bdx: 
+  //                    tile 是一次从 global memory load 的 token chunk
+  // bdy = group size: 一个 block 负责一个 group 的计算
+  // bdz = max(128, bdx*bdy) / (bdx*bdy): 将 tile 在序列维度进一步分片，提升并行度
+
+  // k_smem[stage][bdz][bdy][tile_size_per_bdx][head_dim] 
+  // tile: 在 seq_len 维度上的一个逻辑分块，大小为 = tile_size_per_bdx × bdy × bdz 个 token
+  //       每个 token 对应 head_dim = bdx * vec_size 个元素，一个 threadblock 加载一个 tile
+  // tile_size_per_bdx: 每个 x-dimension 线程负责的 token 数量
+  // bdy = group size: 一个 block 负责一个 group 的计算，所以对每个 token 都要加载 group_size 个 kv
+  // bdz: 补齐线程数
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                           sizeof(DTypeKV));
   size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
                                                 head_dim * sizeof(DTypeKV));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                       sizeof(DTypeKV));
+                                       sizeof(DTypeKV)); // smem for metadata，地址和 kv_offset_smem 一致，同一块 shared mem 在不同 phase 被复用
 
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
@@ -451,7 +465,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;
 
-#pragma unroll
+#pragma unroll // this unrolls a for loop into code like freq[0] = ..., freq[1] = ..., ..., freq[vec_size-1] = ...
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
                 __powf(rope_rcp_theta,
@@ -468,22 +482,30 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
+    // load current qo head's q tensor of current request, only load vec_size (out of head_dim) elements
     q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
   }
 
   // preload k/v tiles
   uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
-  const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
+  const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size]; // total number of pages that this batch's kv cache uses，即规定 page table 的边界，用于 protective_get_kv_offset 防止越界访问
 
   static_assert(num_stages_smem <= bdx);
-  uint32_t packed_page_iter_base = paged_kv.indptr[batch_idx] * paged_kv.page_size + chunk_start;
+  uint32_t packed_page_iter_base = paged_kv.indptr[batch_idx] * paged_kv.page_size + chunk_start; // 当前 req 在全局 KV 序列中的起始 token 位置（逻辑索引），paged_kv.indptr[batch_idx] 代表当前 req 前面的 req 一共占据了几个 page，chunk start 表示从第几个 token 开始
 #pragma unroll
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-    uint32_t q, r;
+    uint32_t q, r; // 页索引 q (商), 页内偏移 r (余数)
+    // n = packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx
+    // j: 当前线程在 tile 内负责的第 j 个 token
+    // j * bdz + tz: 
+    // (j * bdz + tz) * bdy + ty: tile 内 token 偏移，值域是 [0, num tokens per tile = tile_size_per_bdx * bdy * bdz)，这么算是为了保证 warp 内访问的地址连续，比如 j=1时，所有线程访问 token 24~27
+    // ((j * bdz + tz) * bdy + ty) * bdx + tx: token 的特征维度偏移，比如 j=0 时代表 token24 在 head dim 上的 [0,1,2,3]; j=1 时代表 token28 在 head dim 上的 [0,1,2,3]
+    // q = n / page_size = 
     paged_kv.page_size.divmod(packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
     kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
         paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
+        //                               page_iter=q, head_idx=kv_head_idx, entry_idx=r, feat_idx=0, last_indptr=last_indptr
   }
   block.sync();
 
@@ -519,7 +541,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   state_t<vec_size> st;
   float s[bdy * tile_size_per_bdx];
 
-#pragma unroll 2
+#pragma unroll 2 // embed 2 iterations of the loop in a single cycle
   for (uint32_t iter = 0; iter < ceil_div(chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
     if ((iter + num_stages_smem) % bdx == 0) {
 #pragma unroll
@@ -768,7 +790,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                                             vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(padded_batch_size, num_kv_heads);
+      dim3 nblks(padded_batch_size, num_kv_heads); // gridDim，一个 
       dim3 nthrs(bdx, bdy, bdz);
 
       // PDL launch config
