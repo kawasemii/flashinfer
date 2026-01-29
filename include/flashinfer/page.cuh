@@ -36,7 +36,7 @@ namespace flashinfer {
  */
 template <typename DType, typename IdType>
 struct paged_kv_t {
-  uint_fastdiv page_size;
+  uint_fastdiv page_size; // divisor (d) = page size, uint_fastdiv_variable.divmod(n,q,r) means q = n/d, r = n%d
   uint32_t num_heads;
   uint32_t head_dim;
   uint32_t batch_size;
@@ -187,6 +187,8 @@ struct paged_kv_t {
                                                              uint32_t entry_idx, uint32_t feat_idx,
                                                              IdType last_indptr) const {
     if (page_iter < last_indptr) {
+      // indices + page_iter: 找到需要访问的 page index，page_iter 相当于逻辑上的页码（全局逻辑页码，0 1 2 3，不是物理页）
+      // entry_idx: token index
       return get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
     } else {
       return 0;
