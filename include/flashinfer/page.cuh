@@ -52,9 +52,9 @@ struct paged_kv_t {
   IdType* indices; // kv cache's page indices in page table
 
   // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
-  IdType* indptr; // indptr[i]: starting idx of batch i in `indices`
+  IdType* indptr; // indptr[i]: starting idx of request i in `indices`
   // [batch_size] The offset of the last page for each request in the batch
-  IdType* last_page_len; // last_page_len[i]: batch i's last page (the one page that isn't full) len (must be <= page size and > 0)
+  IdType* last_page_len; // last_page_len[i]: request i's last page (the one page that isn't full) len (must be <= page size and > 0)
   // [batch_size] The start position of each request in the batch.
   IdType* rope_pos_offset;
 
