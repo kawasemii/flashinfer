@@ -439,13 +439,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   // tile_size_per_bdx: 每个 x-dimension 线程负责的 token 数量
   // tile_size_per_bdx: 每个 (bdz, bdy) 组额外处理的 token 倍数（用于优化单 query 场景）
   // bdy = group size: 一个 block 负责一个 group 的计算，所以对每个 token 都要加载 group_size 个 kv
-  // bdz: 补齐线程数
+  // bdz: 补齐线程数，为了让 warp 有更大的 token 维度并行度，而不是串行取数据 (?)
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                           sizeof(DTypeKV));
   size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
                                                 head_dim * sizeof(DTypeKV));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                       sizeof(DTypeKV)); // smem for metadata，地址和 kv_offset_smem 一致，同一块 shared mem 在不同 phase 被复用
+                                       sizeof(DTypeKV)); // smem for m (max logit) and d (sum of exp(pre-softmax logits - m))，地址和 kv_offset_smem 一致，同一块 shared mem 在不同 phase 被复用
 
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
@@ -491,12 +491,11 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #pragma unroll
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
     uint32_t q, r; // 页索引 q (商), 页内偏移 r (余数)
-    // n = packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx 代表 token index，一共取 tile_size_per_bdx * bdz * bdy * bdx 个 token
+    // n = packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx 代表在 page table 中的全局逻辑 token index，一共取 tile_size_per_bdx * bdz * bdy * bdx 个 token
     // 一次循环中 block 内每个 thread 读1个 token，这里的索引只是为了方便并行读数据，和后面的实际 attention 计算没有映射关系
     // j: 当前线程在 tile 内负责的第 j 个 token
     // (tz, ty) pair 决定在 tile 内处理哪个 token，tx 决定处理该 token 的 head_dim 的哪一部分
     // (j * bdz + tz) * bdy + ty: tile 内 token 偏移，值域是 [0, num tokens per tile = tile_size_per_bdx * bdy * bdz)，这么算是为了保证 warp 内访问的地址连续，比如 j=1时，所有线程访问 token 24~27
-    // ((j * bdz + tz) * bdy + ty) * bdx + tx: token 的特征维度偏移，比如 j=0 时代表 token24 在 head dim 上的 [0,1,2,3]; j=1 时代表 token28 在 head dim 上的 [0,1,2,3]
     // q = n / page_size = page index
     // r = n % page_size = token's local index inside a page
     paged_kv.page_size.divmod(packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
@@ -531,12 +530,12 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size, // shared mem ptr (dest)
           paged_kv.k_data + kv_offset[j], // global mem ptr (source)
-          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size); // predicate，判断是否访问越界
+          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size); // predicate，判断是否访问越界，越界了就跳过 load 指令，因为 kNoFill 所以也不会往 smem 填0（不填比填快）
     }
     cp_async::commit_group(); // cp.async.commit_group instruction creates a new cp.async-group per thread and batches all prior cp.async instructions initiated by the executing thread but not committed to any cp.async-group into the new cp.async-group. (see https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-commit-group)
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) { // load v data 同上
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>( // 这里 predicate = false 时会填0
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
@@ -572,8 +571,6 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     }
     // compute qk
     // cp.async.wait_group instruction will cause executing thread to wait till only N or fewer of the most recent cp.async-groups are pending and all the prior cp.async-groups committed by the executing threads are complete. (see https://docs.nvidia.com/cuda/parallel-thread-execution/)
-    // 此处 N = 2 * num_stages_smem - 1，因为上面有2个 cp.async-group，每个 group 包含 tile_size_per_bdx 个 cp_async::pred_load operation，所以一共 2*tile_size_per_bdx 个 
-    // 由 DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM 可知 num_stages_smem 的取值集合就是 {1,2}，
     cp_async::wait_group<2 * num_stages_smem - 1>(); // An executing thread can wait for the completion of all cp.async operations in a cp.async-group using cp.async.wait_group.
     block.sync();
     compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
