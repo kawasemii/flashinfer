@@ -187,7 +187,8 @@ struct paged_kv_t {
                                                              uint32_t entry_idx, uint32_t feat_idx,
                                                              IdType last_indptr) const {
     if (page_iter < last_indptr) {
-      // indices + page_iter: 找到需要访问的 page index，page_iter 相当于逻辑上的页码（全局逻辑页码，0 1 2 3，不是物理页）
+      // indices + page_iter: 找到需要访问的物理 page index，page_iter 相当于逻辑上的页码（全局逻辑页码，0 1 2 3，不是物理页），这一步是完成逻辑页码到物理页码的转换
+      // __ldg：走 read-only cache 读取
       // entry_idx: token index
       return get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
     } else {
