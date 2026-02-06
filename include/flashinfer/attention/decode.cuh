@@ -517,6 +517,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       // ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j: token index, iter 是 stages 的 iterator
       // kv_offset_smem 映射 token -> element offset of token (整个 head_dim 向量的起始位置，单位是 DTypeKV 不是 token) in kv data (physical offset)，+ tx * vec_size 是为了算特征维度的偏移
+      // token index = (iter*bdz*dby + tz*bdy + ty) * tile + j，说明 (tz, ty) 相等的一组 thread，读的是同一个 token 的 某一个 kv head 的 长度为 head_dim 的 embedding 向量
+      // 而一整个 block 在一个 iter 内又读的是这个 block 负责的 kv head 的 (tile_size_per_bdx*bdy*bdz) 个连续 token 的 kv offset
+      // thread index = blockId*bdx*bdy*bdz + tz*(bdx*bdy) + ty*bdx + tx= block offset + (tz*bdy+ty)*bdx + tx
+      // 另外由于之前 assert bdx <= 32，所以一个 block 内，相同 (threadIdx.y, threadIdx.z) 的线程的 thread index 是连续的，它们就肯定在同一个 warp 内
       kv_offset[j] =
           kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
     }
@@ -551,18 +555,18 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 
 #pragma unroll 2 // embed 2 iterations of the loop in a single cycle
   // 1 iteration handles a tile = (tile_size_per_bdx * bdy * bdz) tokens
-  // 1 stage = bdx * tile (?) so every `bdx` iterations, we load another "stage" of kv data into smem
+  // kv_offset_smem 存储了 bdx * tile 个 token 的 kv element offset（从上面可以看出一次加载就是这么大的量）
+  // so every `bdx` iterations, we refresh kv offset smem
   for (uint32_t iter = 0; iter < ceil_div(chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
-    // ignore this: (iter + num_stages_smem) 是为了让 main loop 和预取 loop 的 tx 索引模式在 shared memory 中自然错开 num_stages_smem 个空档
     if ((iter + num_stages_smem) % bdx == 0) {
 #pragma unroll
-      // 以下一个 stage 为起点，读 tile_size_per_bdx * bdz * bdy * bdx 个 kv token offset 填入 kv_offset_smem
+      // 读 tile_size_per_bdx * bdz * bdy * bdx 个 kv token offset 填入 kv_offset_smem
       // 也就是读下一个 stage 的 kv offset
-      // 注意每次真正读到 k/v smem 的 kv tensor data 是现在读 kv offset 的这个 stage 的子集，因为 num_stages_smem <= bdx
+      // 注意后面每次 pred_load 到 k/v smem 的 kv tensor data 是现在读 kv offset 对应的 token set 的子集，因为 num_stages_smem <= bdx
       for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
         uint32_t q, r;
         paged_kv.page_size.divmod(
-            packed_page_iter_base + ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz + // 当前 stage 的下一个 stage，(iter+num_stages_smem) = n * bdx, n * bdx * tile = n * stage，n = 1, 2, 3, ...
+            packed_page_iter_base + ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz + // 读取这一轮的 offset 的起点，跳过之前已经读完的 token: (iter+num_stages_smem) = n * bdx, n * bdx * tile 就是 n 轮，n = 1, 2, 3, ...
                                      ((j * bdz + tz) * bdy + ty) * bdx + tx), // 同 preload k/v tiles
             q, r);
         kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
@@ -575,7 +579,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     block.sync();
     compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, batch_idx,
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, // 当前 stage 的起始位置？
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim,
         q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
             chunk_start + iter * tile_size_per_bdx * bdy * bdz, // 无 rope 无 split kv 的情况下，kv_idx_base = iter * tile_size_per_bdx * bdy * bdz，表示当前 tile 在全局 k/v data 的 token index（k, v data 是两个并列的 tensor，所以 k 和 v 内部的同一个位置对应的肯定是相同 token），不过这里只需要 k
@@ -586,6 +590,11 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     block.sync();
 
 #pragma unroll
+    // 一个 block 从 kv offset smem 读取 bdz * bdy * tile_size_per_bdx 个 token 的 kv offset
+    // (iter + num_stages_smem) % bdx 是因为 kv_offset_smem 包含 bdx * (bdz * bdy * tile_size_per_bdx) 个 token 的 offset，
+    // 这里只需要读它的 1/bdx 长度的一段，(iter + num_stages_smem) % bdx) 就是这个“段”的 offset
+    // 因为每次 % bdx == 0 的时候会加载新的 kv offset smem，所以 % bdx == 0 的时候就读起点，% bdx == 1 的时候就往后读一段，以此类推
+    // iter + num_stages_smem < bdx 的时候，kv offset smem 没有更新过，用的是第一次读的数据（就是 preload k/v tiles 那段代码，进入当前 for(iter) 大循环真正开始做 attention 计算之前，读上来的数据
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       kv_offset[j] = kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
                                         tile_size_per_bdx +
@@ -596,6 +605,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // load k tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      // ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j 
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -795,7 +805,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   static_assert(bdx <= 32);
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
-    constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+    constexpr uint32_t num_threads = std::max(128U, bdx * bdy); // max num threads per block = max bdx * max bdy = 32 * 8 = 256 (8 warps)
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
