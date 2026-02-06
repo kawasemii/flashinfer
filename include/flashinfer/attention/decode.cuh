@@ -68,7 +68,7 @@ __device__ __forceinline__ void compute_qk(
     state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz) {
   float m_prev = st.m; // max(qk*sm_scale) = max(qk/sqrt(head_dim))
 #pragma unroll
-  // tile_size = bdy * tile_size_per_bdx
+  // tile_size = bdy * tile_size_per_bdx = group_size * tile_size_per_bdx
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> k_vec;
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
@@ -77,28 +77,38 @@ __device__ __forceinline__ void compute_qk(
                                                   kv_idx_base + tz * tile_size + j);
     } else {
       // do not apply rotary embedding
+      // 一个 thread 一共 load group_size * tile_size_per_bdx 个 vec
+      // 同一组 (ty, tz) 的 bdx 个线程加载的是同一个 token 的 k（的不同 vec）
+      // 同样 tx 的 bdy*bdz 个线程加载的是同样的数据
+      // 一个 threadblock 一共加载 group_size * tile_size_per_bdx 个 token（和 s 的长度相同）
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
     s[j] = 0.f;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      s[j] += q_vec[i] * k_vec[i];
+      s[j] += q_vec[i] * k_vec[i]; // QK^T[i][j] = ith row vec of Q * jth row vec of K
     }
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
+      // parallell reduction，warp 中 lane 0（即 threadIdx.x % 32 == 0 的线程）的 s[j] 包含整个 warp 32 个线程的 s[j] 的累加和
+      // bdx 是2的幂，并且不超过 warp size，所以实际上做的就是把一个 bdx 上的 s[j] 加到 threadIdx.x = 0 的线程的 s[j] 上
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
     s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
-                                   qo_head_idx, kv_head_idx);
+                                   qo_head_idx, kv_head_idx); // alibi / logits cap
     if constexpr (variant.use_softmax) {
-      s[j] *= variant.sm_scale_log2;
+      s[j] *= variant.sm_scale_log2; // qk result * sm scale * log2(e), log2(e) 是为了换底数
     }
 
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
-                                   kv_head_idx);
-    s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
-    st.m = max(st.m, s[j]);
+                                   kv_head_idx); // custom mask / sliding window, 如果都没有则为 true
+    // iter_base: 当前 tile (bdy*bdz*tile_size_per_bdx) 在全局 k/v data 的 token index
+    // + tz * tile_size + j = tz * (bdy*tile_size_per_bdx) + j: token 在 tile 内的 offset，因为一个 block 是 bdy * tile_size_per_bdx 个 token 所以 bdz 个 线程 一起处理一个 tile (bdy*bdz*tile_size_per_bdx) 的 token
+    // TODO：为什么要一个线程去循环 group_size * tile_size_per_bdx 呢？这样不是浪费并行度吗？
+    // iter_bound: kv seq len (if no split kv)
+    s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf; // causal mask (?)
+    st.m = max(st.m, s[j]); // max pre-softmax val
   }
 
   if constexpr (variant.use_softmax) {
@@ -521,6 +531,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       // 而一整个 block 在一个 iter 内又读的是这个 block 负责的 kv head 的 (tile_size_per_bdx*bdy*bdz) 个连续 token 的 kv offset
       // thread index = blockId*bdx*bdy*bdz + tz*(bdx*bdy) + ty*bdx + tx= block offset + (tz*bdy+ty)*bdx + tx
       // 另外由于之前 assert bdx <= 32，所以一个 block 内，相同 (threadIdx.y, threadIdx.z) 的线程的 thread index 是连续的，它们就肯定在同一个 warp 内
+      // 实际上 CUDA 不保证 ty tz 不同的 thread 一定在不同 warp，但是根据 flashinfer 对 head_dim, group_size 的约束，vec_dize \in {8, 16}, bdx \in {4, 8, 16, 32}，所以人为使得一组 (ty, tz) 的线程数肯定整除 warp 大小 (32)，所以不同 ty/tz 值的线程肯定分到不同 warp 中
+      // 实际上 CUDA 不保证 ty tz 不同的 thread 一定在不同 warp，但是根据 flashinfer 对 head_dim, group_size 的约束，vec_dize \in {8, 16}, bdx \in {4, 8, 16, 32}，所以人为使得一组 (ty, tz) 的线程数肯定整除 warp 大小 (32)，所以相同 (ty, tz) 的线程肯定在一个 warp 内而不会被分到不同 warp，一个 warp 可能包含若干个 (ty, tz) 组
       kv_offset[j] =
           kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
     }
@@ -560,8 +572,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   for (uint32_t iter = 0; iter < ceil_div(chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
     if ((iter + num_stages_smem) % bdx == 0) {
 #pragma unroll
+      // 之前的 kv 全都计算完毕，需要取新一轮的 kv offset
       // 读 tile_size_per_bdx * bdz * bdy * bdx 个 kv token offset 填入 kv_offset_smem
-      // 也就是读下一个 stage 的 kv offset
       // 注意后面每次 pred_load 到 k/v smem 的 kv tensor data 是现在读 kv offset 对应的 token set 的子集，因为 num_stages_smem <= bdx
       for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
         uint32_t q, r;
