@@ -77,10 +77,10 @@ __device__ __forceinline__ void compute_qk(
                                                   kv_idx_base + tz * tile_size + j);
     } else {
       // do not apply rotary embedding
-      // 一个 thread 一共 load group_size * tile_size_per_bdx 个 vec
+      // 一个 thread 一共 load group_size * tile_size_per_bdx 个 vec，对应了 float* s 的长度
       // 同一组 (ty, tz) 的 bdx 个线程加载的是同一个 token 的 k（的不同 vec）
-      // 同样 tx 的 bdy*bdz 个线程加载的是同样的数据
-      // 一个 threadblock 一共加载 group_size * tile_size_per_bdx 个 token（和 s 的长度相同）
+      // 同样 tx 的线程，如果 tz 不同，加载的就是 k_smem 上不同段的数据，对应了不同的 token，compute_qk() 传入的 smem 参数本身自带 offset，这个 offset 只和 tz 相关
+      // 一个 threadblock 一共加载 (group_size * tile_size_per_bdx) * bdy * bdz 个 token
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
     s[j] = 0.f;
@@ -91,7 +91,7 @@ __device__ __forceinline__ void compute_qk(
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       // parallell reduction，warp 中 lane 0（即 threadIdx.x % 32 == 0 的线程）的 s[j] 包含整个 warp 32 个线程的 s[j] 的累加和
-      // bdx 是2的幂，并且不超过 warp size，所以实际上做的就是把一个 bdx 上的 s[j] 加到 threadIdx.x = 0 的线程的 s[j] 上
+      // bdx 是2的幂，并且不超过 warp size，所以实际上做的就是把一个 bdx 上的 s[j] 加到 threadIdx.x = 0 的线程的 s[j] 上，形成一个完整的 qk 向量点积结果
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
@@ -103,8 +103,9 @@ __device__ __forceinline__ void compute_qk(
 
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
                                    kv_head_idx); // custom mask / sliding window, 如果都没有则为 true
-    // iter_base: 当前 tile (bdy*bdz*tile_size_per_bdx) 在全局 k/v data 的 token index
+    // iter_base: 当前 tile (bdy*bdz*tile_size_per_bdx) 在全局 k/v data 的 token index，对整个 block 都是相等的
     // + tz * tile_size + j = tz * (bdy*tile_size_per_bdx) + j: token 在 tile 内的 offset，因为一个 block 是 bdy * tile_size_per_bdx 个 token 所以 bdz 个 线程 一起处理一个 tile (bdy*bdz*tile_size_per_bdx) 的 token
+    // token index 只和 tz 有关，因为相同 (tx, ty) 线程在这个函数里分到的 smem 是同一个指针
     // TODO：为什么要一个线程去循环 group_size * tile_size_per_bdx 呢？这样不是浪费并行度吗？
     // iter_bound: kv seq len (if no split kv)
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf; // causal mask (?)
@@ -527,7 +528,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       // ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j: token index, iter 是 stages 的 iterator
       // kv_offset_smem 映射 token -> element offset of token (整个 head_dim 向量的起始位置，单位是 DTypeKV 不是 token) in kv data (physical offset)，+ tx * vec_size 是为了算特征维度的偏移
-      // token index = (iter*bdz*dby + tz*bdy + ty) * tile + j，说明 (tz, ty) 相等的一组 thread，读的是同一个 token 的 某一个 kv head 的 长度为 head_dim 的 embedding 向量
+      // token index = (iter*bdz*bdy + tz*bdy + ty) * tile + j，说明 (tz, ty) 相等的一组 thread，读的是同一个 token 的 某一个 kv head 的 长度为 head_dim 的 embedding 向量
       // 而一整个 block 在一个 iter 内又读的是这个 block 负责的 kv head 的 (tile_size_per_bdx*bdy*bdz) 个连续 token 的 kv offset
       // thread index = blockId*bdx*bdy*bdz + tz*(bdx*bdy) + ty*bdx + tx= block offset + (tz*bdy+ty)*bdx + tx
       // 另外由于之前 assert bdx <= 32，所以一个 block 内，相同 (threadIdx.y, threadIdx.z) 的线程的 thread index 是连续的，它们就肯定在同一个 warp 内
@@ -591,7 +592,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     block.sync();
     compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, batch_idx,
-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim,
+        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, // 传入的 smem 起始位置只和 tz 相关，所以 bdz 个线程负责一个 tile，每个线程分配到 tile_size_per_bdx * bdy 个 token 的 qk 计算
         q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
             chunk_start + iter * tile_size_per_bdx * bdy * bdz, // 无 rope 无 split kv 的情况下，kv_idx_base = iter * tile_size_per_bdx * bdy * bdz，表示当前 tile 在全局 k/v data 的 token index（k, v data 是两个并列的 tensor，所以 k 和 v 内部的同一个位置对应的肯定是相同 token），不过这里只需要 k
@@ -614,7 +615,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
                      tx * vec_size;
     }
 
-    // load k tiles
+    // load k tiles（k 用完了，加载下个 tile = bdy * bdz * tile_size_per_bdx 个 token）
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       // ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j 
@@ -629,11 +630,12 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
+    // 计算当前 tile 的 softmax(qk) * v
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
     block.sync();
 
-    // load v tiles
+    // load v tiles（v 用完了，加载下个 tile，同上 load k tiles）
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
