@@ -103,6 +103,7 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
   if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
     int src_in_bytes = predicate ? 16 : 0;
     if constexpr (prefetch_mode == PrefetchMode::kPrefetch) {
+      // cp.async.cg.shared.global.L2::128B: 把 global memory 的数据，通过 L2 cache，异步拷贝到 shared memory
       asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
                    "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
     } else {
