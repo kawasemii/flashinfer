@@ -2352,7 +2352,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                      (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                      warp_idx, lane_idx);
       cp_async::commit_group();
-    }
+    } // for iter < num_iterations
     cp_async::wait_group<0>();
     block.sync();
 
