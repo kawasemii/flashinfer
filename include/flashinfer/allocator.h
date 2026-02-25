@@ -36,7 +36,7 @@ struct AlignedAllocator {
   AlignedAllocator(void* buf, size_t space) : base_ptr(buf), cur_ptr(buf), remaining_space(space) {}
   template <typename T>
   T* aligned_alloc(size_t size, size_t alignment, std::string name) {
-    if (std::align(alignment, size, cur_ptr, remaining_space)) {
+    if (std::align(alignment, size, cur_ptr, remaining_space)) { // 把 cur_ptr 向前移动到满足 alignment 对齐的位置，并检查剩余空间不小于 size 
       T* result = reinterpret_cast<T*>(cur_ptr);
       cur_ptr = (char*)cur_ptr + size;
       remaining_space -= size;
@@ -51,6 +51,7 @@ struct AlignedAllocator {
     return nullptr;
   }
 
+  // 返回 “这次 aligned_alloc 分配地址相对 base_ptr 的字节偏移”
   size_t aligned_alloc_offset(size_t size, size_t alignment, std::string name) {
     return (char*)aligned_alloc<char>(size, alignment, name) - (char*)base_ptr;
   }
