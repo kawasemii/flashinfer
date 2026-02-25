@@ -116,7 +116,7 @@ void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_
 
   cudaSetDevice(v.device().device_id);
   auto stream = get_stream(v.device());
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] {
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] { // csrc/tvm_ffi_utils.h
     cudaError_t status = MergeStates(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_merged.data_ptr()), static_cast<float*>(s_merged.data_ptr()),
