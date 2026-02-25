@@ -507,7 +507,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
+    packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size); // qo len in tokens * group size 表示一个 kv head 处理的 Q 矩阵的行数（一行就是一个 token 在一个 qo head 下的 query vector），把 Q head 维度折叠进 Q 行维度
     if (packed_qo_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
@@ -546,7 +546,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       sum_packed_qo_len += packed_qo_len_arr[i];
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim); // 16/64/128
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -555,7 +555,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
 
   // Calculate the actual needed CTA when considering sliding window
-  std::vector<int64_t> effective_kv_len_arr(batch_size);
+  std::vector<int64_t> effective_kv_len_arr(batch_size); // if no attn window, effective_kv_len_arr == kv_len_arr
   for (uint32_t i = 0; i < batch_size; ++i) {
     // pad CTA_TILE_Q to consider the causal kv-len
     effective_kv_len_arr[i] =
@@ -568,7 +568,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     kv_chunk_size = std::numeric_limits<int64_t>::max();
   } else if (!disable_split_kv && fixed_split_size > 0) {
     kv_chunk_size = fixed_split_size;
-  } else {
+  } else { // cascade attn
     std::tie(split_kv, kv_chunk_size) = PrefillBinarySearchKVChunkSize(
         enable_cuda_graph, max_batch_size_if_split, packed_qo_len_arr, effective_kv_len_arr,
         cta_tile_q, min_kv_chunk_size);
