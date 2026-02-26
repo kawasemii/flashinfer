@@ -46,11 +46,11 @@ using tvm::ffi::Optional;
 
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
-    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
-    TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr, // qo kv indptr, kv lens 都是 host (见 prefill.py wrapper plan)
+    TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads, // total_num_rows = int(qo_indptr_host[-1]) (qo 不分页，所以 qo_indptr[i+1] - qo_indptr[i] = num tokens of req i's query); batch_size = len(qo_indptr) - 1
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
+    int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size, // fixed_split_size: 默认 -1. The fixed split size for split-kv FA2 prefill/decode, in pages. Recommend setting to the average sequence length of your workload. When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore batch-size invariant outputs.
+    bool disable_split_kv, int64_t num_colocated_ctas = 0) { // disable_split_kv = false
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -292,7 +292,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
 
-        params.request_indices =
+        params.request_indices = // 在 PrefillPlan 函数中设置，内容在 PrefillSplitQOKVIndptr() 被计算并以 std::vector 形式返回，然后用 std::copy() 拷贝到 page_locked_int_buffer (pinned cpu memory)，最后 H2D 到 int_buffer
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
