@@ -72,23 +72,24 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   }
 }
 
+// 一块 shared memory，既可以按 Q/K/V 的布局访问，也可以按 warp-sync 的临时 buffer 使用（qkv, m/o, out 三者共享同一块内存，在 attention 不同阶段复用内存）
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
 struct SharedStorageQKVO {
   union {
     struct {
-      alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
-      alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK];
+      alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK]; // Q tile, 供整个 CTA 内的 warp 读取, 每个 warp 拿自己的 Q fragment 做 MMA
+      alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK]; // 存储 K tile, KV tile 会被多个 warp 重用, 所以通常是先 load KV 到 shared memory，再被 NUM_WARPS_Q 个 warp 用来计算不同 Q tile
       alignas(16) DTypeKV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
           16) std::conditional_t<NUM_WARPS_KV == 1, float[1],
-                                 float[NUM_WARPS_KV * CTA_TILE_Q * HEAD_DIM_VO]> cta_sync_o_smem;
+                                 float[NUM_WARPS_KV * CTA_TILE_Q * HEAD_DIM_VO]> cta_sync_o_smem; // 仅在 split-K 或多 warp-KV 情况下用
       alignas(16) std::conditional_t<NUM_WARPS_KV == 1, float2[1],
-                                     float2[NUM_WARPS_KV * CTA_TILE_Q]> cta_sync_md_smem;
+                                     float2[NUM_WARPS_KV * CTA_TILE_Q]> cta_sync_md_smem; // softmax 相关的最大值和 sum
     };
-    alignas(16) DTypeO smem_o[CTA_TILE_Q * HEAD_DIM_VO];
+    alignas(16) DTypeO smem_o[CTA_TILE_Q * HEAD_DIM_VO]; // 最终输出片段
   };
 };
 
@@ -117,12 +118,12 @@ struct KernelTraits {
   static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
 
-  static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B;
+  static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B; // include/flashinfer/permuted_smem.cuh
   static constexpr SwizzleMode SWIZZLE_MODE_KV =
       (sizeof(DTypeKV_) == 1 && HEAD_DIM_VO == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   static constexpr uint32_t KV_THR_LAYOUT_ROW = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 8;
   static constexpr uint32_t KV_THR_LAYOUT_COL = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 8 : 4;
-  static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
+  static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_; // include/flashinfer/pos_enc.cuh
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
   using DTypeO = DTypeO_;
@@ -2071,7 +2072,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint_fastdiv& group_size = params.group_size;
 
     uint32_t* maybe_prefix_len_ptr = nullptr;
-    if constexpr (has_maybe_prefix_len_ptr_v<Params>) {
+    if constexpr (has_maybe_prefix_len_ptr_v<Params>) { // DEFINE_HAS_MEMBER() at the top of this file
       maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
     }
     uint16_t* maybe_token_pos_in_items_ptr = nullptr;
@@ -2557,24 +2558,24 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
-  constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
+  constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q); // cta_tile_q > 64 ? 2 : 1
+  constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q); // cta_tile_q > 16 ? 4 : 1
+  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q); // 4 / NUM_WARPS_Q, 一个 CTA 里有多少个 warp 专门负责 KV 方向的并行
 
-  if (padded_batch_size == 0) {
+  if (padded_batch_size == 0) { // if !enable cuda graph, padded_batch_size = new_batch_size = batch_size * num_tiles_q * num_chunks_kv
     // No request, skip
     // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
     return cudaSuccess;
   }
 
-  dim3 nblks(padded_batch_size, 1, num_kv_heads);
-  dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+  dim3 nblks(padded_batch_size, 1, num_kv_heads); // grid dim
+  dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV); // block dim
 
-  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16; // 把 head_dim 映射到 Tensor Core 的 MMA 次数。在 QK^T 计算中，沿着 head_dim_qk 方向需要多少个 16-wide 的 MMA
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using DTypeQKAccum =
       typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
-                                float>::type;
+                                float>::type; // USE_FP16_QK_REDUCTION 是 prefill wrapper plan 函数参数，默认 false，所以 q@k accumulate 默认 float
 
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -2583,19 +2584,19 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + // 一个 CTA 要缓存一块 Q tile 到 shared memory，CTA_TILE_Q = 一个 threadblock 负责多少 Q 行（token 数）; "2*" 意思是这里在算2个 CTA 占用的 shared memory
+                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV)) // (HEAD_DIM_QK + HEAD_DIM_VO): K 和 V 的维度; 16: tensor core mma 是 16*16*16, 每个 warp 每次处理 16 个 token (16行 kv); NUM_WARPS_KV: 每个 warp 负责一块 KV, warp 之间要并行加载不同 KV tile, 前面的算式算了单个 warp 的 kv tile 大小，这里乘以 warp 数来算一个 threadblock 的空间占用
           ? 2
           : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
-  const uint32_t max_num_mma_kv_reg =
-      (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
+  const uint32_t max_num_mma_kv_reg = // 一个 thread 在 KV 方向最多能做多少个 MMA（matrix multiply accumulate）操作，reg = regsiter
+      (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && // “我们发现这种配置会寄存器爆炸，所以强行限制”?
        !USE_FP16_QK_REDUCTION)
           ? 2
-          : (8 / NUM_MMA_Q);
-  const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
+          : (8 / NUM_MMA_Q); // 每个 thread 最多容纳 8 组 MMA accumulator => NUM_MMA_KV ≤ 8 / NUM_MMA_Q
+  const uint32_t max_num_mma_kv_smem = // 一个 warp 处理的 kv tile ("循环次数") (每个 warp 在 K/V 方向上连续做多少个 MMA)
+      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / // 全部 smem - Q 需要的 smem
       ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
