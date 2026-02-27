@@ -586,17 +586,17 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_chunks_kv; ++kv_tile_idx) {
         new_batch_size += 1;
-        request_indices.push_back(request_idx);
+        request_indices.push_back(request_idx); // 算这些应该主要是因为 prefill q 长度不一致，不能像 decode 那样通过 block/grid 信息得知 tile index (?)
         qo_tile_indices.push_back(q_tile_idx);
         kv_tile_indices.push_back(kv_tile_idx);
       }
     }
 
-    int64_t qo_len = packed_qo_len / gqa_group_size;
+    int64_t qo_len = packed_qo_len / gqa_group_size; // qo_len = qo_indptr_h[request_idx + 1] - qo_indptr_h[request_idx], i.e. qo len in tokens
     for (uint32_t row = 0; row < qo_len; ++row) {
-      merge_indptr.push_back(merge_indptr.back() + num_chunks_kv);
+      merge_indptr.push_back(merge_indptr.back() + num_chunks_kv); // merge_indptr[i] = q_tokens[i]'s partial results' starting index，例如当前 request 有 qo_len = 3, num_chunks_kv = 2, 那么每个 token 产生2 partial results, 一共产生6 partial，则 merge_indptr = [0, 2, 4, 6], 表示 token0 partial 在 [0,2), token1 partial: [2,4), ...
     }
-    o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv);
+    o_indptr.push_back(o_indptr.back() + qo_len * num_chunks_kv); // 每个 request 对应多少个 partial output
   }
 
   const size_t padded_batch_size =
