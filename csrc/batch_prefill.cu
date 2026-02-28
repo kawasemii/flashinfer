@@ -288,6 +288,9 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.partition_kv = false;
 
         ADDITIONAL_PARAMS_SETTER
+        // maybe_prefix_len_ptr: prefix length of each prompt, if not none, mask mode will be set to MULTIITEMSCORING
+        // maybe_token_pos_in_items_ptr, maybe_max_item_len_ptr 应该和上面这个 multi item scoring 也是配套的
+        
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
