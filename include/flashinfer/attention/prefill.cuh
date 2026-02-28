@@ -2102,7 +2102,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                    kv_tile_idx = kv_tile_indices[bx];
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
-    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
+    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len, // request's qo/kv len in pages, == indptr[request_idx + 1] - indptr[request_idx]
                    window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
