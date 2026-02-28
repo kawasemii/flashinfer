@@ -114,11 +114,11 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
   int64_t high = max_kv_len;
   constexpr int64_t min_kv_len = 1;
   while (low < high) {
-    const int64_t mid = (low + high) / 2;
+    const int64_t mid = (low + high) / 2; // search on kv chunk size
     int64_t new_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
-      new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
-                        ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
+      new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * // num_tiles_q of this request
+                        ceil_div(std::max(kv_len_arr[i], min_kv_len), mid); // num_chunks_kv of this request
     }
     if (new_batch_size > max_batch_size_if_split) {
       low = mid + 1;
@@ -126,6 +126,7 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
       high = mid;
     }
   }
+  // find lowest kv chunk size that satisfies `new_batch_size <= max_batch_size_if_split`
   return std::make_tuple(enable_cuda_graph || low < max_kv_len, low);
 }
 
@@ -531,7 +532,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // When CUDA graphs are enabled, the lengths of sequences determined by
     // qo_indptr_h can vary. We assume that the dummy data based on which
     // the CUDA graph is created fixes the maximum number of tokens.
-    const uint64_t max_seq_len = total_num_rows - batch_size + 1;
+    const uint64_t max_seq_len = total_num_rows - batch_size + 1; // 极端情况：假设 (batch_size - 1) 个 request 的 seq len = 1
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
     cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
 
@@ -732,6 +733,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
 
+  // 把 PrefillSplitQOKVIndptr 返回的各种 vec 复制到 cpu 上的 page_locked_int_buffer
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * padded_batch_size, 16, "batch_prefill_request_indices");
@@ -767,6 +769,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
   std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
   kv_chunk_size_ptr_h[0] = kv_chunk_size;
+  // 如果 PrefillSplitQOKVIndptr 返回 split_kv == true, 在 device float buffer 分配 tmp_v, tmp_s, 
+  // 把 merge_indptr_vec 复制到 cpu pinned buffer, 在 cpu pinned buffer 上填写 block_valid_mask
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
@@ -789,6 +793,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
     }
   }
 
+  // H2D, 把 cpu pinned buffer 复制给 gpu int buffer
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
