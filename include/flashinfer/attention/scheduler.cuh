@@ -607,7 +607,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                    "split size, please consider disabling cuda graph.");
 
   // step 4: multiply kv_chunk_size by page_size
-  kv_chunk_size *= page_size;
+  kv_chunk_size *= page_size; // binary search 的 low/high 是以 page 为单位 (low=1, high=max(kv_len_arr), kv_len 是用 kv_indptr 算的，后者就是以 page 为单位), 所以这里乘上 page size 转为 token 单位的 kv chunk size
   return std::make_tuple(split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size,
                          std::move(request_indices), std::move(qo_tile_indices),
                          std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
