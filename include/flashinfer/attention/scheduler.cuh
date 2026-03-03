@@ -794,6 +794,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   }
 
   // H2D, 把 cpu pinned buffer 复制给 gpu int buffer
+  // 注: cudaMemcpyAsync (H2D / D2H) 需要 pinned memory（cudaMallocHost 分配）才能真异步
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
